@@ -139,7 +139,7 @@ public:
 	bool	IsLengthLessThan( float val ) const;
 
 	// check if a vector is within the box defined by two other vectors
-	FORCEINLINE bool WithinAABox( Vector const &boxmin, Vector const &boxmax);
+	FORCEINLINE bool WithinAABox( Vector const &boxmin, Vector const &boxmax) const;
  
 	// Get the distance from this vector to the other one.
 	vec_t	DistTo(const Vector &vOther) const;
@@ -1276,7 +1276,7 @@ inline vec_t VectorNormalize( Vector& v )
 
 
 // check a point against a box
-bool Vector::WithinAABox( Vector const &boxmin, Vector const &boxmax)
+bool Vector::WithinAABox( Vector const &boxmin, Vector const &boxmax) const
 {
 	return ( 
 		( x >= boxmin.x ) && ( x <= boxmax.x) &&

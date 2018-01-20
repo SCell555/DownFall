@@ -74,6 +74,8 @@
 #include "c_point_camera.h"
 #endif // USE_MONITORS
 
+#include "c_func_water_analog.h"
+
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
 
@@ -150,6 +152,7 @@ static ConVar fog_enableskybox( "fog_enableskybox", "1", FCVAR_CHEAT );
 static ConVar fog_maxdensity( "fog_maxdensity", "-1", FCVAR_CHEAT );
 static ConVar fog_hdrcolorscale( "fog_hdrcolorscale", "-1", FCVAR_CHEAT );
 static ConVar fog_hdrcolorscaleskybox( "fog_hdrcolorscaleskybox", "-1", FCVAR_CHEAT );
+static ConVar fog_enable_water_fog( "fog_enable_water_fog", "1", FCVAR_CHEAT );
 static void FogOverrideCallback( IConVar *pConVar, char const *pOldString, float flOldValue )
 {
 	C_BasePlayer *localPlayer = C_BasePlayer::GetLocalPlayer();
@@ -531,12 +534,12 @@ class CSimpleWorldView : public CBaseWorldView
 public:
 	CSimpleWorldView(CViewRender *pMainView) : CBaseWorldView( pMainView ) {}
 
-	void			Setup( const CViewSetup &view, int nClearFlags, bool bDrawSkybox, const VisibleFogVolumeInfo_t &fogInfo, const WaterRenderInfo_t& info, ViewCustomVisibility_t *pCustomVisibility = NULL );
+	void			Setup( const CViewSetup &view, int nClearFlags, bool bDrawSkybox, const VisibleFogVolumeInfo_t &fogInfo, const WaterRenderInfo_t& info, ViewCustomVisibility_t *pCustomVisibility = NULL, WaterAnalogInfo_t* pWaterAnalogInfo = NULL );
 	void			Draw();
 
 private: 
-	VisibleFogVolumeInfo_t m_fogInfo;
-
+	VisibleFogVolumeInfo_t	m_fogInfo;
+	WaterAnalogInfo_t		m_waterAnalogInfo;
 };
 
 
@@ -579,6 +582,7 @@ protected:
 	float m_waterZAdjust;
 	bool m_bSoftwareUserClipPlane;
 	VisibleFogVolumeInfo_t m_fogInfo;
+	WaterAnalogInfo_t m_waterAnalogInfo;
 };
 
 
@@ -596,7 +600,7 @@ public:
 		m_IntersectionView( pMainView )
 	{}
 
-	void Setup(  const CViewSetup &view, bool bDrawSkybox, const VisibleFogVolumeInfo_t &fogInfo, const WaterRenderInfo_t& waterInfo );
+	void Setup(  const CViewSetup &view, bool bDrawSkybox, const VisibleFogVolumeInfo_t &fogInfo, const WaterRenderInfo_t& waterInfo, WaterAnalogInfo_t* pAnalogInfo );
 	void			Draw();
 
 	class CReflectionView : public CBaseWorldView
@@ -663,7 +667,7 @@ public:
 		m_RefractionView( pMainView )
 	{}
 
-	void			Setup( const CViewSetup &view, bool bDrawSkybox, const VisibleFogVolumeInfo_t &fogInfo, const WaterRenderInfo_t& info );
+	void			Setup( const CViewSetup &view, bool bDrawSkybox, const VisibleFogVolumeInfo_t &fogInfo, const WaterRenderInfo_t& info, WaterAnalogInfo_t* pAnalogInfo );
 	void			Draw();
 
 	class CRefractionView : public CBaseWorldView
@@ -2682,7 +2686,10 @@ void CViewRender::DrawWorldAndEntities( bool bDrawSkybox, const CViewSetup &view
 	WaterRenderInfo_t info;
 	DetermineWaterRenderInfo( fogVolumeInfo, info );
 
-	if ( info.m_bCheapWater )
+	WaterAnalogInfo_t waterAnalogInfo;
+	const bool bFoundAnalogWater = FindWaterAnalogInView( viewIn.origin, &fogVolumeInfo, &info, &waterAnalogInfo );
+
+	if ( info.m_bCheapWater || ( bFoundAnalogWater && fogVolumeInfo.m_bEyeInFogVolume ) )
 	{		     
 		tmZone( TELEMETRY_LEVEL0, TMZF_NONE, "bCheapWater" );
 		cplane_t glassReflectionPlane;
@@ -2698,7 +2705,7 @@ void CViewRender::DrawWorldAndEntities( bool bDrawSkybox, const CViewSetup &view
 		}
 
 		CRefPtr<CSimpleWorldView> pNoWaterView = new CSimpleWorldView( this );
-		pNoWaterView->Setup( viewIn, nClearFlags, bDrawSkybox, fogVolumeInfo, info, pCustomVisibility );
+		pNoWaterView->Setup( viewIn, nClearFlags, bDrawSkybox, fogVolumeInfo, info, pCustomVisibility, bFoundAnalogWater ? &waterAnalogInfo : NULL );
 		AddViewToScene( pNoWaterView );
 		return;
 	}
@@ -2716,14 +2723,14 @@ void CViewRender::DrawWorldAndEntities( bool bDrawSkybox, const CViewSetup &view
 	{
 		tmZone( TELEMETRY_LEVEL0, TMZF_NONE, "CAboveWaterView" );
 		CRefPtr<CAboveWaterView> pAboveWaterView = new CAboveWaterView( this );
-		pAboveWaterView->Setup( viewIn, bDrawSkybox, fogVolumeInfo, info );
+		pAboveWaterView->Setup( viewIn, bDrawSkybox, fogVolumeInfo, info, bFoundAnalogWater ? &waterAnalogInfo : NULL );
 		AddViewToScene( pAboveWaterView );
 	}
 	else
 	{
 		tmZone( TELEMETRY_LEVEL0, TMZF_NONE, "CUnderWaterView" );
 		CRefPtr<CUnderWaterView> pUnderWaterView = new CUnderWaterView( this );
-		pUnderWaterView->Setup( viewIn, bDrawSkybox, fogVolumeInfo, info );
+		pUnderWaterView->Setup( viewIn, bDrawSkybox, fogVolumeInfo, info, bFoundAnalogWater ? &waterAnalogInfo : NULL );
 		AddViewToScene( pUnderWaterView );
 	}
 }
@@ -2749,9 +2756,9 @@ static void SetLightmapScaleForWater(void)
 //-----------------------------------------------------------------------------
 // Returns true if the view plane intersects the water
 //-----------------------------------------------------------------------------
-bool DoesViewPlaneIntersectWater( float waterZ, int leafWaterDataID )
+bool DoesViewPlaneIntersectWater( float waterZ, int leafWaterDataID, int fakeWaterIndex = -1 )
 {
-	if ( leafWaterDataID == -1 )
+	if ( leafWaterDataID == -1 && fakeWaterIndex == -1 )
 		return false;
 
 #ifdef PORTAL //when rendering portal views point/plane intersections just don't cut it.
@@ -2804,7 +2811,7 @@ bool DoesViewPlaneIntersectWater( float waterZ, int leafWaterDataID )
 	
 	// the near plane does cross the z value for the visible water volume.  Call into
 	// the engine to find out if the near plane intersects the water volume.
-	return render->DoesBoxIntersectWaterVolume( mins, maxs, leafWaterDataID );
+	return fakeWaterIndex != -1 ? BoxIntersectWaterAnalogVolume( mins, maxs, fakeWaterIndex ) : render->DoesBoxIntersectWaterVolume( mins, maxs, leafWaterDataID );
 } 
 
 #ifdef PORTAL 
@@ -3521,7 +3528,7 @@ void CRendering3dView::BuildWorldRenderLists( bool bDrawEntities, int iForceView
 	}
 }
 
-
+static bool bFakeUnderWaterLeafCheck = false;
 //-----------------------------------------------------------------------------
 // Purpose: Computes the actual world list info based on the render flags
 //-----------------------------------------------------------------------------
@@ -3556,7 +3563,7 @@ void CRendering3dView::PruneWorldListInfo()
 		for ( int i = 0; i < m_pWorldListInfo->m_LeafCount; ++i )
 		{
 			bool bLeafIsUnderwater = ( m_pWorldListInfo->m_pLeafFogVolume[i] != -1 );
-			if ( bRenderingUnderwater == bLeafIsUnderwater )
+			if ( bRenderingUnderwater == bLeafIsUnderwater || bFakeUnderWaterLeafCheck )
 			{
 				pNewInfo->m_pLeafList[ pNewInfo->m_LeafCount ] = m_pWorldListInfo->m_pLeafList[ i ];
 				pNewInfo->m_pLeafFogVolume[ pNewInfo->m_LeafCount ] = m_pWorldListInfo->m_pLeafFogVolume[ i ];
@@ -5425,7 +5432,9 @@ void CBaseWorldView::DrawSetup( float waterHeight, int nSetupFlags, float waterZ
 	bool bDrawReflection = ( nSetupFlags & DF_RENDER_REFLECTION ) != 0;
 	BuildWorldRenderLists( bDrawEntities, iForceViewLeaf, true, false, bDrawReflection ? &waterHeight : NULL );
 
+	bFakeUnderWaterLeafCheck = ( nSetupFlags & ( DF_RENDER_REFRACTION | DF_UNUSED3 ) ) == ( DF_RENDER_REFRACTION | DF_UNUSED3 );
 	PruneWorldListInfo();
+	bFakeUnderWaterLeafCheck = false;
 
 	if ( bDrawEntities )
 	{
@@ -5701,12 +5710,17 @@ void CBaseWorldView::DrawDepthOfField( )
 //-----------------------------------------------------------------------------
 // Draws the scene when there's no water or only cheap water
 //-----------------------------------------------------------------------------
-void CSimpleWorldView::Setup( const CViewSetup &view, int nClearFlags, bool bDrawSkybox, const VisibleFogVolumeInfo_t &fogInfo, const WaterRenderInfo_t &waterInfo, ViewCustomVisibility_t *pCustomVisibility )
+void CSimpleWorldView::Setup( const CViewSetup &view, int nClearFlags, bool bDrawSkybox, const VisibleFogVolumeInfo_t &fogInfo, const WaterRenderInfo_t &waterInfo, ViewCustomVisibility_t *pCustomVisibility, WaterAnalogInfo_t* pWaterAnalogInfo )
 {
 	BaseClass::Setup( view );
 
 	m_ClearFlags = nClearFlags;
 	m_DrawFlags = DF_DRAW_ENTITITES;
+
+	if ( pWaterAnalogInfo )
+		m_waterAnalogInfo = *pWaterAnalogInfo;
+	else
+		m_waterAnalogInfo.bActive = false;
 
 	if ( !waterInfo.m_bOpaqueWater )
 	{
@@ -5714,7 +5728,7 @@ void CSimpleWorldView::Setup( const CViewSetup &view, int nClearFlags, bool bDra
 	}
 	else
 	{
-		bool bViewIntersectsWater = DoesViewPlaneIntersectWater( fogInfo.m_flWaterHeight, fogInfo.m_nVisibleFogVolume );
+		bool bViewIntersectsWater = DoesViewPlaneIntersectWater( fogInfo.m_flWaterHeight, fogInfo.m_nVisibleFogVolume, m_waterAnalogInfo.bActive ? m_waterAnalogInfo.iWaterIndex : -1 );
 		if( bViewIntersectsWater )
 		{
 			// have to draw both sides if we can see both.
@@ -5770,7 +5784,19 @@ void CSimpleWorldView::Draw()
 	{
 		m_ClearFlags |= VIEW_CLEAR_COLOR;
 
-		SetFogVolumeState( m_fogInfo, false );
+		if ( !m_waterAnalogInfo.bActive )
+			SetFogVolumeState( m_fogInfo, false );
+		else if ( fog_enable_water_fog.GetBool() && m_waterAnalogInfo.bFogEnabled )
+		{
+			CMatRenderContextPtr pRenderContext( materials );
+			pRenderContext->SetFogZ( m_fogInfo.m_flWaterHeight );
+			pRenderContext->FogMode( MATERIAL_FOG_LINEAR );
+
+			pRenderContext->FogColor3fv( m_waterAnalogInfo.fogColor.Base() );
+			pRenderContext->FogStart( m_waterAnalogInfo.fogStart );
+			pRenderContext->FogEnd( m_waterAnalogInfo.fogEnd );
+			pRenderContext->FogMaxDensity( 1.0 );
+		}
 
 		pRenderContext.GetFrom( materials );
 
@@ -5851,9 +5877,14 @@ void CBaseWaterView::CSoftwareIntersectionView::Draw()
 //-----------------------------------------------------------------------------
 // Draws the scene when the view point is above the level of the water
 //-----------------------------------------------------------------------------
-void CAboveWaterView::Setup( const CViewSetup &view, bool bDrawSkybox, const VisibleFogVolumeInfo_t &fogInfo, const WaterRenderInfo_t& waterInfo )
+void CAboveWaterView::Setup( const CViewSetup &view, bool bDrawSkybox, const VisibleFogVolumeInfo_t &fogInfo, const WaterRenderInfo_t& waterInfo, WaterAnalogInfo_t* pWaterAnalogInfo )
 {
 	BaseClass::Setup( view );
+
+	if ( pWaterAnalogInfo )
+		m_waterAnalogInfo = *pWaterAnalogInfo;
+	else
+		m_waterAnalogInfo.bActive = false;
 
 	m_bSoftwareUserClipPlane = g_pMaterialSystemHardwareConfig->UseFastClipping();
 
@@ -6053,10 +6084,25 @@ void CAboveWaterView::CRefractionView::Draw()
 	// Store off view origin and angles and set the new view
 	int nSaveViewID = CurrentViewID();
 	SetupCurrentView( origin, angles, VIEW_REFRACTION );
+	if ( GetOuter()->m_waterAnalogInfo.bActive )
+		m_DrawFlags |= DF_UNUSED3;
 
 	DrawSetup( GetOuter()->m_waterHeight, m_DrawFlags, GetOuter()->m_waterZAdjust );
 
-	SetFogVolumeState( GetOuter()->m_fogInfo, true );
+	if ( !GetOuter()->m_waterAnalogInfo.bActive )
+		SetFogVolumeState( GetOuter()->m_fogInfo, true );
+	else if ( fog_enable_water_fog.GetBool() && GetOuter()->m_waterAnalogInfo.bFogEnabled )
+	{
+		CMatRenderContextPtr pRenderContext( materials );
+		pRenderContext->SetFogZ( GetOuter()->m_fogInfo.m_flWaterHeight );
+		pRenderContext->FogMode( MATERIAL_FOG_LINEAR_BELOW_FOG_Z );
+
+		pRenderContext->FogColor3fv( GetOuter()->m_waterAnalogInfo.fogColor.Base() );
+		pRenderContext->FogStart( GetOuter()->m_waterAnalogInfo.fogStart );
+		pRenderContext->FogEnd( GetOuter()->m_waterAnalogInfo.fogEnd );
+		pRenderContext->FogMaxDensity( 1.0 );
+	}
+
 	SetClearColorToFogColor();
 	DrawExecute( GetOuter()->m_waterHeight, VIEW_REFRACTION, GetOuter()->m_waterZAdjust );
 
@@ -6092,7 +6138,19 @@ void CAboveWaterView::CIntersectionView::Draw()
 {
 	DrawSetup( GetOuter()->m_fogInfo.m_flWaterHeight, m_DrawFlags, 0 );
 
-	SetFogVolumeState( GetOuter()->m_fogInfo, true );
+	if ( !GetOuter()->m_waterAnalogInfo.bActive )
+		SetFogVolumeState( GetOuter()->m_fogInfo, true );
+	else if ( fog_enable_water_fog.GetBool() && GetOuter()->m_waterAnalogInfo.bFogEnabled )
+	{
+		CMatRenderContextPtr pRenderContext( materials );
+		pRenderContext->SetFogZ( GetOuter()->m_fogInfo.m_flWaterHeight );
+		pRenderContext->FogMode( MATERIAL_FOG_LINEAR_BELOW_FOG_Z );
+
+		pRenderContext->FogColor3fv( GetOuter()->m_waterAnalogInfo.fogColor.Base() );
+		pRenderContext->FogStart( GetOuter()->m_waterAnalogInfo.fogStart );
+		pRenderContext->FogEnd( GetOuter()->m_waterAnalogInfo.fogEnd );
+		pRenderContext->FogMaxDensity( 1.0 );
+	}
 	SetClearColorToFogColor( );
 	DrawExecute( GetOuter()->m_fogInfo.m_flWaterHeight, VIEW_NONE, 0 );
 	CMatRenderContextPtr pRenderContext( materials );
@@ -6103,9 +6161,14 @@ void CAboveWaterView::CIntersectionView::Draw()
 //-----------------------------------------------------------------------------
 // Draws the scene when the view point is under the level of the water
 //-----------------------------------------------------------------------------
-void CUnderWaterView::Setup( const CViewSetup &view, bool bDrawSkybox, const VisibleFogVolumeInfo_t &fogInfo, const WaterRenderInfo_t& waterInfo )
+void CUnderWaterView::Setup( const CViewSetup &view, bool bDrawSkybox, const VisibleFogVolumeInfo_t &fogInfo, const WaterRenderInfo_t& waterInfo, WaterAnalogInfo_t* pWaterAnalogInfo )
 {
 	BaseClass::Setup( view );
+
+	if ( pWaterAnalogInfo )
+		m_waterAnalogInfo = *pWaterAnalogInfo;
+	else
+		m_waterAnalogInfo.bActive = false;
 
 	m_bSoftwareUserClipPlane = g_pMaterialSystemHardwareConfig->UseFastClipping();
 
@@ -6115,7 +6178,7 @@ void CUnderWaterView::Setup( const CViewSetup &view, bool bDrawSkybox, const Vis
 	if (engine->GetDXSupportLevel() >= 90 )					// screen voerlays underwater are a dx9 feature
 	{
 		IMaterialVar *pScreenOverlayVar = pWaterMaterial->FindVar( "$underwateroverlay", NULL, false );
-		if ( pScreenOverlayVar && ( pScreenOverlayVar->IsDefined() ) )
+		if ( pScreenOverlayVar && pScreenOverlayVar->IsDefined() && pScreenOverlayVar->GetType() == MATERIAL_VAR_TYPE_STRING )
 		{
 			char const *pOverlayName = pScreenOverlayVar->GetStringValue();
 			if ( pOverlayName[0] != '0' )						// fixme!!!
@@ -6171,14 +6234,37 @@ void CUnderWaterView::Draw()
 
 	if ( !m_waterInfo.m_bRefract )
 	{
-		SetFogVolumeState( m_fogInfo, true );
+		if ( !m_waterAnalogInfo.bActive )
+			SetFogVolumeState( m_fogInfo, true );
+		else if ( fog_enable_water_fog.GetBool() && m_waterAnalogInfo.bFogEnabled )
+		{
+			pRenderContext->SetFogZ( m_fogInfo.m_flWaterHeight );
+			pRenderContext->FogMode( MATERIAL_FOG_LINEAR_BELOW_FOG_Z );
+
+			pRenderContext->FogColor3fv( m_waterAnalogInfo.fogColor.Base() );
+			pRenderContext->FogStart( m_waterAnalogInfo.fogStart );
+			pRenderContext->FogEnd( m_waterAnalogInfo.fogEnd );
+			pRenderContext->FogMaxDensity( 1.0 );
+		}
 		unsigned char ucFogColor[3];
 		pRenderContext->GetFogColor( ucFogColor );
 		pRenderContext->ClearColor4ub( ucFogColor[0], ucFogColor[1], ucFogColor[2], 255 );
 	}
 
 	DrawSetup( m_waterHeight, m_DrawFlags, m_waterZAdjust );
-	SetFogVolumeState( m_fogInfo, false );
+	if ( !m_waterAnalogInfo.bActive )
+		SetFogVolumeState( m_fogInfo, false );
+	else if ( fog_enable_water_fog.GetBool() && m_waterAnalogInfo.bFogEnabled )
+	{
+		CMatRenderContextPtr pRenderContext( materials );
+		pRenderContext->SetFogZ( m_fogInfo.m_flWaterHeight );
+		pRenderContext->FogMode( MATERIAL_FOG_LINEAR );
+
+		pRenderContext->FogColor3fv( m_waterAnalogInfo.fogColor.Base() );
+		pRenderContext->FogStart( m_waterAnalogInfo.fogStart );
+		pRenderContext->FogEnd( m_waterAnalogInfo.fogEnd );
+		pRenderContext->FogMaxDensity( 1.0 );
+	}
 	DrawExecute( m_waterHeight, CurrentViewID(), m_waterZAdjust );
 	m_ClearFlags = 0;
 
@@ -6221,7 +6307,18 @@ void CUnderWaterView::CRefractionView::Setup()
 void CUnderWaterView::CRefractionView::Draw()
 {
 	CMatRenderContextPtr pRenderContext( materials );
-	SetFogVolumeState( GetOuter()->m_fogInfo, true );
+	if ( !GetOuter()->m_waterAnalogInfo.bActive )
+		SetFogVolumeState( GetOuter()->m_fogInfo, true );
+	else if ( fog_enable_water_fog.GetBool() && GetOuter()->m_waterAnalogInfo.bFogEnabled )
+	{
+		pRenderContext->SetFogZ( GetOuter()->m_fogInfo.m_flWaterHeight );
+		pRenderContext->FogMode( MATERIAL_FOG_LINEAR_BELOW_FOG_Z );
+
+		pRenderContext->FogColor3fv( GetOuter()->m_waterAnalogInfo.fogColor.Base() );
+		pRenderContext->FogStart( GetOuter()->m_waterAnalogInfo.fogStart );
+		pRenderContext->FogEnd( GetOuter()->m_waterAnalogInfo.fogEnd );
+		pRenderContext->FogMaxDensity( 1.0 );
+	}
 	unsigned char ucFogColor[3];
 	pRenderContext->GetFogColor( ucFogColor );
 	pRenderContext->ClearColor4ub( ucFogColor[0], ucFogColor[1], ucFogColor[2], 255 );
